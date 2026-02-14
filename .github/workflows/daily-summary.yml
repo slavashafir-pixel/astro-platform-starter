@@ -1,0 +1,189 @@
+name: Daily Standup Summary
+
+on:
+  schedule:
+    # Runs every day at 8:00 AM UTC
+    - cron: "0 8 * * *"
+  workflow_dispatch: # Allow manual triggers
+
+permissions:
+  issues: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  daily-summary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate daily summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const since = new Date();
+            since.setDate(since.getDate() - 1);
+            const sinceISO = since.toISOString();
+            const today = new Date().toISOString().split('T')[0];
+
+            // Fetch recent commits
+            const commits = await github.rest.repos.listCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              since: sinceISO,
+              per_page: 50,
+            });
+
+            // Fetch recently opened PRs
+            const prs = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'all',
+              sort: 'updated',
+              direction: 'desc',
+              per_page: 20,
+            });
+            const recentPRs = prs.data.filter(
+              pr => new Date(pr.updated_at) >= since
+            );
+
+            // Fetch recently updated issues (exclude PRs)
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'all',
+              sort: 'updated',
+              direction: 'desc',
+              since: sinceISO,
+              per_page: 20,
+            });
+            const recentIssues = issues.data.filter(i => !i.pull_request);
+
+            // Build the summary
+            let body = `## Daily Standup Summary — ${today}\n\n`;
+            body += `Activity from the last 24 hours (since ${sinceISO.split('T')[0]}).\n\n`;
+
+            // Commits section
+            body += `### Commits (${commits.data.length})\n\n`;
+            if (commits.data.length === 0) {
+              body += '_No commits in the last 24 hours._\n\n';
+            } else {
+              // Group by author
+              const byAuthor = {};
+              for (const c of commits.data) {
+                const author = c.author?.login || c.commit.author.name;
+                if (!byAuthor[author]) byAuthor[author] = [];
+                byAuthor[author].push(c);
+              }
+
+              for (const [author, authorCommits] of Object.entries(byAuthor)) {
+                body += `**${author}** (${authorCommits.length} commit${authorCommits.length > 1 ? 's' : ''}):\n`;
+                for (const c of authorCommits) {
+                  const shortSha = c.sha.substring(0, 7);
+                  const msg = c.commit.message.split('\n')[0];
+                  body += `- [\`${shortSha}\`](${c.html_url}) ${msg}\n`;
+                }
+                body += '\n';
+              }
+
+              // Flag security-related commits
+              const securityCommits = commits.data.filter(c =>
+                c.commit.message.toLowerCase().includes('security') ||
+                c.commit.message.toLowerCase().includes('cve') ||
+                c.commit.message.toLowerCase().includes('vulnerability')
+              );
+              if (securityCommits.length > 0) {
+                body += `> **Security-related commits detected (${securityCommits.length})** — review recommended.\n\n`;
+              }
+            }
+
+            // Pull Requests section
+            body += `### Pull Requests (${recentPRs.length} updated)\n\n`;
+            if (recentPRs.length === 0) {
+              body += '_No PR activity in the last 24 hours._\n\n';
+            } else {
+              const opened = recentPRs.filter(pr => new Date(pr.created_at) >= since);
+              const merged = recentPRs.filter(pr => pr.merged_at && new Date(pr.merged_at) >= since);
+              const closed = recentPRs.filter(pr => pr.state === 'closed' && !pr.merged_at && new Date(pr.closed_at) >= since);
+
+              if (opened.length > 0) {
+                body += `**Opened:**\n`;
+                for (const pr of opened) {
+                  body += `- [#${pr.number}](${pr.html_url}) ${pr.title} (by @${pr.user.login})\n`;
+                }
+                body += '\n';
+              }
+              if (merged.length > 0) {
+                body += `**Merged:**\n`;
+                for (const pr of merged) {
+                  body += `- [#${pr.number}](${pr.html_url}) ${pr.title}\n`;
+                }
+                body += '\n';
+              }
+              if (closed.length > 0) {
+                body += `**Closed (not merged):**\n`;
+                for (const pr of closed) {
+                  body += `- [#${pr.number}](${pr.html_url}) ${pr.title}\n`;
+                }
+                body += '\n';
+              }
+            }
+
+            // Issues section
+            body += `### Issues (${recentIssues.length} updated)\n\n`;
+            if (recentIssues.length === 0) {
+              body += '_No issue activity in the last 24 hours._\n\n';
+            } else {
+              const newIssues = recentIssues.filter(i => new Date(i.created_at) >= since);
+              const closedIssues = recentIssues.filter(i => i.state === 'closed' && new Date(i.closed_at) >= since);
+
+              if (newIssues.length > 0) {
+                body += `**New:**\n`;
+                for (const i of newIssues) {
+                  body += `- [#${i.number}](${i.html_url}) ${i.title} (by @${i.user.login})\n`;
+                }
+                body += '\n';
+              }
+              if (closedIssues.length > 0) {
+                body += `**Closed:**\n`;
+                for (const i of closedIssues) {
+                  body += `- [#${i.number}](${i.html_url}) ${i.title}\n`;
+                }
+                body += '\n';
+              }
+            }
+
+            body += `---\n_Generated automatically by the [Daily Standup Summary](../actions/workflows/daily-summary.yml) workflow._\n`;
+
+            // Create the issue
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Daily Standup — ${today}`,
+              body: body,
+              labels: ['daily-summary'],
+            });
+
+            core.info(`Daily summary issue created for ${today}`);
+
+      - name: Ensure label exists
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'daily-summary',
+              });
+            } catch {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'daily-summary',
+                color: '0075ca',
+                description: 'Automated daily standup summary',
+              });
+            }
